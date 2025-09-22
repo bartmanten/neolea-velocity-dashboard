@@ -1,0 +1,130 @@
+# spins_dashboard.py — clean dashboard for Neolea, 4W/52W/YTD
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Neolea — SPINS Dashboard", layout="wide")
+DATA_DIR = Path("data")
+CSV_PATH = DATA_DIR / "neolea_spins_consolidated.csv"
+
+
+def _is_national_rollup(chain: str) -> bool:
+    s = (chain or "").upper().strip()
+    return s in {
+        "TOTAL US - NATURAL EXPANDED CHANNEL",
+        "TOTAL US - FOOD",
+        "TOTAL US - MULO",
+    }
+
+
+@st.cache_data
+def load_data(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    # Normalize types
+    df["chain"] = df["chain"].astype(str).str.strip()
+    df["brand"] = df["brand"].astype(str).str.strip().str.upper()
+    df["period"] = df["period"].astype(str).str.upper().str.replace(" ", "")
+    for c in ["units", "dollars", "stores", "weeks_in_period"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "report_month" in df.columns:
+        df["report_month"] = pd.to_datetime(df["report_month"], errors="coerce")
+    return df
+
+
+def _safe_sppw(units, stores, weeks):
+    import pandas as pd
+    if pd.notna(units) and pd.notna(stores) and stores > 0 and pd.notna(weeks) and weeks > 0:
+        return units / stores / weeks
+    return None
+
+
+st.title("🫒 Neolea – SPINS Retailer Dashboard")
+
+if not CSV_PATH.exists():
+    st.error(f"Missing data file: {CSV_PATH}. In Terminal run:  python -m backend.ingest")
+    st.stop()
+
+df = load_data(CSV_PATH)
+
+# Brand is fixed to NEOLEA by ingest, but filter just in case
+df = df[df["brand"] == "NEOLEA"].copy()
+
+# Sidebar
+with st.sidebar:
+    st.header("Filters")
+
+    # 1) Period
+    period = st.radio(
+        "Period",
+        options=["4W", "52W", "YTD"],
+        index=0,
+        key="period_radio",
+    )
+
+    # 2) Month (from selected period)
+    months_avail = (
+        df[df["period"] == period]["report_month"]
+        .dropna()
+        .sort_values()
+        .dt.to_period("M")
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    sel_month = st.selectbox(
+        "Report month",
+        options=months_avail if months_avail else [],
+        index=len(months_avail) - 1 if months_avail else 0,
+        key="month_select",
+        placeholder="No months available for this period",
+    )
+
+    hide_rollups = st.checkbox(
+        "Hide national rollups (TOTAL US …)", value=True, key="hide_rollups"
+    )
+
+# Apply filters
+dfp = df[df["period"] == period].copy()
+if sel_month:
+    dfp = dfp[dfp["report_month"].dt.to_period("M").astype(str) == sel_month]
+if hide_rollups:
+    dfp = dfp[~dfp["chain"].astype(str).apply(_is_national_rollup)]
+
+if dfp.empty:
+    st.warning("No rows match your filters.")
+    st.stop()
+
+# KPIs
+col1, col2, col3, col4 = st.columns(4)
+total_units = float(dfp["units"].sum(skipna=True))
+total_dollars = float(dfp["dollars"].sum(skipna=True))
+total_stores = float(dfp["stores"].sum(skipna=True))
+
+vel_vals = []
+for _, r in dfp.iterrows():
+    vel_vals.append(_safe_sppw(r.get("units"), r.get("stores"), r.get("weeks_in_period")))
+vel_vals = [v for v in vel_vals if v is not None]
+velocity_sppw = sum(vel_vals) / len(vel_vals) if vel_vals else None
+
+col1.metric("Units (sum)", f"{int(round(total_units)):,}")
+col2.metric("Sales $ (sum)", f"${total_dollars:,.0f}")
+col3.metric("Stores (sum)", f"{int(round(total_stores)):,}")
+col4.metric("Velocity / store / week", f"{velocity_sppw:.3f}" if velocity_sppw is not None else "—")
+
+st.divider()
+
+# Retailer table
+st.subheader("Retailer view (Neolea)")
+show_cols = ["chain", "units", "dollars", "stores", "weeks_in_period", "velocity_spw", "report_month", "period"]
+present = [c for c in show_cols if c in dfp.columns]
+tbl = dfp[present].sort_values("units", ascending=False)
+st.dataframe(tbl, use_container_width=True)
+
+# Download
+st.download_button(
+    label="⬇️ Download current view (CSV)",
+    data=tbl.to_csv(index=False),
+    file_name=f"neolea_{period}_{sel_month or 'all'}.csv",
+    mime="text/csv",
+)
