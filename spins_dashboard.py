@@ -1,83 +1,117 @@
-# --- Minimal, cloud-safe Streamlit app (CSV only) ---
+# spins_dashboard.py — Verification-first dashboard (single-period, brand=NEOLEA)
 
 from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Neolea – SPINS (Selected Period, CSV only)", layout="wide")
+st.set_page_config(page_title="Neolea – SPINS Verifier", layout="wide")
 
 CSV_PATH = Path("data/neolea_spins_singleperiod.csv")
 
-# ---- Load data
+# ---------- Load ----------
 if not CSV_PATH.exists():
-    st.error(f"Data file not found: {CSV_PATH}. Commit it to the repo (data/...).")
+    st.error(f"Data file not found: {CSV_PATH}\nBuild it locally with:\n  python - <<'PY'\nfrom pathlib import Path\nimport pandas as pd\nfrom backend.ingest import ingest_single_period\nfiles = sorted(Path('data').glob('*.xlsb'))\nparts = []\nfor f in files:\n    d = ingest_single_period(f)\n    d['source_file'] = f.name\n    parts.append(d)\nif parts:\n    out = pd.concat(parts, ignore_index=True)\n    out.to_csv('data/neolea_spins_singleperiod.csv', index=False)\n    print('Wrote data/neolea_spins_singleperiod.csv rows:', len(out))\nelse:\n    print('No .xlsb files found under ./data')\nPY")
     st.stop()
 
-df = pd.read_csv(CSV_PATH)
+df = pd.read_csv(CSV_PATH, dtype={"report_month": "string"}, low_memory=False)
 
-# Clean types
-for col in ["units", "dollars", "stores"]:
-    if col in df:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+# Normalize columns that should exist
+expected = ["chain","units","dollars","stores","brand","report_date","report_month","period"]
+for c in expected:
+    if c not in df.columns:
+        df[c] = pd.NA
 
-# Only Neolea (defensive)
-if "brand" in df:
-    df = df[df["brand"].astype(str).str.upper() == "NEOLEA"].copy()
-
-# Parse report_month if present
+# Types / cleaning
+df["chain"] = df["chain"].astype(str).str.strip()
+df["brand"] = df["brand"].astype(str).str.strip()
+df["period"] = df["period"].astype(str).str.strip()
 if "report_month" in df:
     df["report_month"] = pd.to_datetime(df["report_month"], errors="coerce")
-    df = df.dropna(subset=["report_month"])
 
-# ---- Sidebar filters
+# Filter to Neolea only
+df = df[df["brand"].str.upper() == "NEOLEA"].copy()
+
+# ---------- UI: pick ONE period then retailers ----------
 st.sidebar.header("Filters")
+periods = [p for p in sorted(df["period"].dropna().unique().tolist()) if p and p != "nan"]
+if not periods:
+    st.error("No period labels found in CSV. The ingest didn’t detect ‘4w’, ‘52w’ or ‘ytd’.")
+    st.stop()
 
-# month(s)
-if "report_month" in df:
-    months = sorted(df["report_month"].dt.strftime("%Y-%m-%d").unique().tolist())
-    picked_months = st.sidebar.multiselect("Report month(s)", options=months, default=months)
-    if picked_months:
-        df = df[df["report_month"].dt.strftime("%Y-%m-%d").isin(picked_months)]
-else:
-    st.sidebar.info("This CSV has no 'report_month' column.")
+picked_period = st.sidebar.selectbox("Period", periods, index=0)
 
-# retailers (chains)
-if "chain" in df:
-    all_chains = sorted(df["chain"].astype(str).fillna("").unique().tolist())
-    picked_chains = st.sidebar.multiselect("Retailers (chains)", options=all_chains, default=all_chains)
-    if picked_chains:
-        df = df[df["chain"].astype(str).isin(picked_chains)]
-else:
-    st.sidebar.warning("No 'chain' column in CSV.")
+dfp = df[df["period"] == picked_period].copy()
+if len(dfp) == 0:
+    st.warning(f"No rows for period: {picked_period}")
+    st.stop()
 
-# ---- Metrics
-st.title("Neolea – SPINS (Selected Period)")
+retailers = sorted(dfp["chain"].dropna().unique().tolist())
+picked_retailers = st.sidebar.multiselect(
+    "Retailers",
+    options=retailers,
+    default=retailers,
+    key="retailers_ms",
+)
 
-u = float(df["units"].sum(skipna=True)) if "units" in df else 0.0
-d = float(df["dollars"].sum(skipna=True)) if "dollars" in df else 0.0
+if not picked_retailers:
+    st.info("Pick at least one retailer.")
+    st.stop()
 
-# IMPORTANT: stores here are simple sum from CSV (selected period).
-s = float(df["stores"].sum(skipna=True)) if "stores" in df else 0.0
+dfv = dfp[dfp["chain"].isin(picked_retailers)].copy()
 
-# Velocity = units per store for the selected period
-vel = (u / s) if s > 0 else float("nan")
+# ---------- KPIs ----------
+# Stores here are **per retailer** doors for the selected period. Summing across retailers
+# gives total doors across selected retailers (not store-weeks).
+total_units = pd.to_numeric(dfv["units"], errors="coerce").sum(skipna=True)
+total_dollars = pd.to_numeric(dfv["dollars"], errors="coerce").sum(skipna=True)
+# Two ways to show "stores": sum across retailers, and median per retailer (sanity check)
+stores_series = pd.to_numeric(dfv["stores"], errors="coerce")
+stores_sum = stores_series.sum(skipna=True)
+stores_median = stores_series.median(skipna=True)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Units (sum)", f"{int(round(u)):,.0f}")
-c2.metric("Sales $ (sum)", f"${d:,.0f}")
-c3.metric("Stores (sum)", f"{int(round(s)):,.0f}")
-c4.metric("Velocity SPP", f"{vel:,.3f}" if pd.notna(vel) else "—")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Units (sum)", f"{int(round(total_units)):,}")
+col2.metric("Sales $ (sum)", f"${total_dollars:,.0f}")
+col3.metric("Stores (sum of retailers)", f"{int(round(stores_sum)):,}")
+col4.metric("Stores per Retailer (median)", f"{stores_median:,.0f}" if pd.notna(stores_median) else "—")
 
-st.markdown("---")
+st.caption(
+    "Note: ‘Stores (sum of retailers)’ is the simple sum of each retailer’s **doors** in the selected period. "
+    "Doors should not be multiplied by weeks. If this sum looks too high, the CSV may contain store-weeks instead of doors."
+)
 
-# ---- Table
-show_cols = [c for c in ["chain", "units", "dollars", "stores"] if c in df.columns]
-if show_cols:
-    st.subheader("Retailer detail")
-    st.dataframe(
-        df[show_cols].sort_values("dollars", ascending=False) if "dollars" in show_cols else df[show_cols],
-        use_container_width=True
-    )
-else:
-    st.info("No expected columns found in CSV.")
+# ---------- Table ----------
+show_cols = ["chain","units","dollars","stores","period","report_date","report_month"]
+show_cols = [c for c in show_cols if c in dfv.columns]
+st.dataframe(dfv[show_cols].sort_values("chain"), use_container_width=True)
 
+# ---------- Debug / Verification ----------
+with st.expander("🔎 Debug / Verify what the app is reading", expanded=False):
+    st.write("**CSV path:**", str(CSV_PATH))
+    st.write("**Columns present:**", list(df.columns))
+    st.write("**Dtypes:**")
+    st.write(df.dtypes.astype(str).to_dict())
+
+    st.write("**Unique periods in CSV:**", sorted([p for p in df["period"].dropna().unique().tolist() if p and p != "nan"]))
+    st.write("**Unique chains (this period):**", retailers)
+
+    st.write("**First 15 rows for this period (Neolea only):**")
+    st.dataframe(dfp.head(15), use_container_width=True)
+
+    # Fresh Market sanity check
+    fm = dfp[dfp["chain"].str.contains("FRESH MARKET", case=False, na=False)].copy()
+    if len(fm):
+        st.subheader("The Fresh Market rows (selected period)")
+        st.dataframe(fm[show_cols], use_container_width=True)
+        fm_stores = pd.to_numeric(fm["stores"], errors="coerce")
+        st.write("Fresh Market stores values:", fm_stores.tolist())
+        # warn if clearly store-weeks
+        if fm_stores.max() and fm_stores.max() > 300:
+            st.error(
+                "⚠️ The Fresh Market `stores` value is > 300. That looks like **store-weeks**, not doors. "
+                "We need to adjust the ingest to use the **‘# of Stores Selling’** column from the Retailer tab (Column X)."
+            )
+    else:
+        st.write("No Fresh Market row found for this period in the CSV.")
+
+st.success("Loaded CSV and filtered to Neolea. Pick a period and retailers in the sidebar.")
